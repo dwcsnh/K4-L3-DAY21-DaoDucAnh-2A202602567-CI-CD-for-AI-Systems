@@ -58,35 +58,80 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Authenticate to Cloud Storage
-        # TODO 2: Ghi noi dung credentials ra file tam va set bien moi truong xac thuc.
         env:
           STORAGE_CREDENTIALS: ${{ secrets.STORAGE_CREDENTIALS }}
         run: |
           python - <<'PYEOF'
-          import json, os
-          creds_str = os.environ.get("STORAGE_CREDENTIALS", "").strip()
+          import json, os, sys
+
+          raw = os.environ.get("STORAGE_CREDENTIALS", "").strip()
+          if not raw:
+              print("::error::Secret STORAGE_CREDENTIALS is empty or not found! Please check GitHub Secrets.", file=sys.stderr)
+              sys.exit(1)
+
+          # Kiem tra neu la GCP JSON (co chua private_key)
           try:
-              creds = json.loads(creds_str)
-              if "private_key" in creds:
-                  # GCP Service Account JSON
+              data = json.loads(raw)
+              if isinstance(data, dict) and "private_key" in data:
                   with open("/tmp/sa-key.json", "w") as f:
-                      json.dump(creds, f)
+                      json.dump(data, f)
                   with open(os.environ["GITHUB_ENV"], "a") as env_file:
                       env_file.write("GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa-key.json\n")
-                  print("Authenticated with GCP credentials.")
-              else:
-                  # AWS IAM credentials
-                  with open(os.environ["GITHUB_ENV"], "a") as env_file:
-                      env_file.write(f"AWS_ACCESS_KEY_ID={creds.get('aws_access_key_id', '')}\n")
-                      env_file.write(f"AWS_SECRET_ACCESS_KEY={creds.get('aws_secret_access_key', '')}\n")
-                      env_file.write(f"AWS_DEFAULT_REGION={creds.get('aws_region', 'us-east-1')}\n")
-                  print("Authenticated with AWS credentials.")
-          except Exception as e:
-              # Fallback cho chuoi connection string Azure
+                  print("Authenticated with GCP Service Account.")
+                  sys.exit(0)
+          except Exception:
+              pass
+
+          # Xu ly AWS credentials (ho tro ca dinh dang JSON, key=val, INI, hoac export)
+          key_id, secret, region = None, None, "us-east-1"
+
+          # 1. Thu parse dang JSON
+          try:
+              data = json.loads(raw)
+              if isinstance(data, dict):
+                  key_id = data.get("aws_access_key_id") or data.get("AWS_ACCESS_KEY_ID") or data.get("access_key")
+                  secret = data.get("aws_secret_access_key") or data.get("AWS_SECRET_ACCESS_KEY") or data.get("secret_key")
+                  region = data.get("aws_region") or data.get("AWS_DEFAULT_REGION") or data.get("region") or "us-east-1"
+          except Exception:
+              pass
+
+          # 2. Neu khong phai JSON, parse theo tung dong (key=val hoac INI)
+          if not (key_id and secret):
+              for line in raw.splitlines():
+                  line = line.strip().replace("export ", "")
+                  if "=" in line:
+                      k, v = line.split("=", 1)
+                      k = k.strip().upper()
+                      v = v.strip().strip("\"'")
+                      if "ACCESS_KEY_ID" in k or k == "AWS_ACCESS_KEY":
+                          key_id = v
+                      elif "SECRET_ACCESS_KEY" in k or k == "AWS_SECRET_KEY":
+                          secret = v
+                      elif "REGION" in k:
+                          region = v
+
+          if key_id and secret:
+              # Ghi vao ~/.aws/credentials va ~/.aws/config cho AWS CLI, DVC (s3fs), boto3
+              aws_dir = os.path.expanduser("~/.aws")
+              os.makedirs(aws_dir, exist_ok=True)
+              with open(os.path.join(aws_dir, "credentials"), "w") as f:
+                  f.write(f"[default]\naws_access_key_id = {key_id}\naws_secret_access_key = {secret}\n")
+              with open(os.path.join(aws_dir, "config"), "w") as f:
+                  f.write(f"[default]\nregion = {region}\noutput = json\n")
+
+              # Export vao GITHUB_ENV
               with open(os.environ["GITHUB_ENV"], "a") as env_file:
-                  env_file.write(f"AZURE_STORAGE_CONNECTION_STRING={creds_str}\n")
-              print("Set AZURE_STORAGE_CONNECTION_STRING.")
+                  env_file.write(f"AWS_ACCESS_KEY_ID={key_id}\n")
+                  env_file.write(f"AWS_SECRET_ACCESS_KEY={secret}\n")
+                  env_file.write(f"AWS_DEFAULT_REGION={region}\n")
+                  env_file.write(f"AWS_REGION={region}\n")
+
+              print(f"Authenticated with AWS credentials successfully (Region: {region}).")
+          else:
+              print("::error::Khong the trich xuat AWS credentials tu secret STORAGE_CREDENTIALS. Vui long kiem tra lai noi dung secret!", file=sys.stderr)
+              sys.exit(1)
           PYEOF
+
 
       - name: Pull data with DVC
         # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
