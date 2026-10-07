@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from google.cloud import storage
 import joblib
+import boto3
 import os
 
 app = FastAPI()
@@ -31,7 +32,10 @@ def download_model():
     # TODO 4: In thong bao thanh cong
     # print("Model da duoc tai xuong tu cloud storage.")
 
-    pass  # xoa dong nay sau khi hoan thanh tat ca TODO ben tren
+    s3 = boto3.client("s3")
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    s3.download_file(ARTIFACT_BUCKET, MODEL_KEY, MODEL_PATH)
+    print(f"Model downloaded from s3://{ARTIFACT_BUCKET}/{MODEL_KEY}")
 
 
 download_model()
