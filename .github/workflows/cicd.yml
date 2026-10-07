@@ -48,6 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       f1: ${{ steps.read_report.outputs.f1 }}
+      prev_f1: ${{ steps.check_prev_model.outputs.prev_f1 }}
 
     steps:
       - uses: actions/checkout@v4
@@ -135,12 +136,52 @@ jobs:
           PYEOF
 
 
+      - name: Check previous model from Cloud Storage (Bonus 4)
+        id: check_prev_model
+        env:
+          ARTIFACT_BUCKET: ${{ secrets.ARTIFACT_BUCKET }}
+        run: |
+          python - <<'PYEOF'
+          import os, json
+          bucket_name = os.environ.get("ARTIFACT_BUCKET", "")
+          key = "artifacts/current/report.json"
+          prev_f1 = 0.0
+
+          try:
+              if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+                  from google.cloud import storage
+                  client = storage.Client()
+                  bucket = client.bucket(bucket_name)
+                  blob = bucket.blob(key)
+                  if blob.exists():
+                      data = json.loads(blob.download_as_text())
+                      prev_f1 = float(data.get("f1_score", 0.0))
+              else:
+                  import boto3
+                  s3 = boto3.client("s3")
+                  s3.download_file(bucket_name, key, "/tmp/prev_report.json")
+                  with open("/tmp/prev_report.json") as f:
+                      data = json.load(f)
+                      prev_f1 = float(data.get("f1_score", 0.0))
+              print(f"Bonus 4 - Tim thay phien ban cu tren cloud: F1 cu = {prev_f1:.4f}")
+          except Exception as e:
+              print(f"Bonus 4 - Khong tim thay phien ban cu tren cloud (hoac lan dau deploy): {e}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"prev_f1={prev_f1}\n")
+          PYEOF
+
       - name: Pull data with DVC
         # TODO 3: Pull cac file du lieu can thiet tu cloud storage bang lenh dvc pull.
         #         Chi pull train_batch1.csv va holdout.csv (khong can train_batch2.csv).
         run: dvc pull data/train_batch1.csv.dvc data/holdout.csv.dvc
 
       - name: Train model
+        env:
+          # Bonus 1 (neu nguoi dung cau hinh DagsHub remote tracking)
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
         run: python src/train.py
 
       - name: Read report
@@ -151,7 +192,7 @@ jobs:
           F1=$(python -c "import json; d=json.load(open('outputs/report.json')); print(d['f1_score'])")
           echo "f1=$F1" >> $GITHUB_OUTPUT
 
-      - name: Upload model to Cloud Storage
+      - name: Upload model and report to Cloud Storage
         # TODO 5: Su dung cloud SDK de upload models/model.joblib len
         #         <bucket>/artifacts/current/model.joblib.
         #         Ten bucket lay tu secret ARTIFACT_BUCKET.
@@ -162,27 +203,34 @@ jobs:
           import os
           bucket_name = os.environ["ARTIFACT_BUCKET"]
           model_path = "models/model.joblib"
-          key = "artifacts/current/model.joblib"
+          report_path = "outputs/report.json"
+          model_key = "artifacts/current/model.joblib"
+          report_key = "artifacts/current/report.json"
 
           if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
               from google.cloud import storage
               client = storage.Client()
               bucket = client.bucket(bucket_name)
-              blob = bucket.blob(key)
-              blob.upload_from_filename(model_path)
-              print(f"Uploaded {model_path} to gs://{bucket_name}/{key}")
+              bucket.blob(model_key).upload_from_filename(model_path)
+              bucket.blob(report_key).upload_from_filename(report_path)
+              print(f"Uploaded {model_path} to gs://{bucket_name}/{model_key}")
+              print(f"Uploaded {report_path} to gs://{bucket_name}/{report_key}")
           else:
               import boto3
               s3 = boto3.client("s3")
-              s3.upload_file(model_path, bucket_name, key)
-              print(f"Uploaded {model_path} to s3://{bucket_name}/{key}")
+              s3.upload_file(model_path, bucket_name, model_key)
+              s3.upload_file(report_path, bucket_name, report_key)
+              print(f"Uploaded {model_path} to s3://{bucket_name}/{model_key}")
+              print(f"Uploaded {report_path} to s3://{bucket_name}/{report_key}")
           PYEOF
 
-      - name: Save report as artifact
+      - name: Save report as artifact (Bonus 3)
         uses: actions/upload-artifact@v4
         with:
-          name: report
-          path: outputs/report.json
+          name: reports
+          path: |
+            outputs/report.json
+            outputs/detail.txt
 
 
   # ---------------------------------------------------------------------------
@@ -201,18 +249,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - name: Check quality gate
+      - name: Check quality gate & regression safeguard (Bonus 4)
         # TODO 6: Doc f1 tu output cua job train.
         #         Neu f1 < 0.65, ket thuc voi loi ro rang.
         #         Neu dat nguong, in thong bao va tiep tuc.
         run: |
           python - <<'PYEOF'
           f1 = float("${{ needs.train.outputs.f1 }}")
+          prev_f1_raw = "${{ needs.train.outputs.prev_f1 }}".strip()
+          prev_f1 = float(prev_f1_raw) if prev_f1_raw else 0.0
           threshold = 0.65
-          print(f"F1 score danh gia: {f1:.4f} (Nguong toi thieu: {threshold})")
+
+          print(f"Quality Gate - F1 danh gia: {f1:.4f} (Nguong toi thieu: {threshold})")
           if f1 < threshold:
               raise SystemExit(f"FAILED: f1_score {f1:.4f} < {threshold}. Huy trien khai.")
-          print("PASSED: f1_score dat nguong chat luong. Cho phep trien khai.")
+          print("PASSED: f1_score dat nguong chat luong toi thieu.")
+
+          # Bonus 4: Kiem tra hoi quy (Rollback / Hoan tra ve phien ban truoc neu model kem hon)
+          if prev_f1 > 0:
+              print(f"Bonus 4 - So sanh voi model dang chay: F1 moi ({f1:.4f}) vs F1 cu ({prev_f1:.4f})")
+              if f1 < prev_f1:
+                  raise SystemExit(
+                      f"FAILED: Phat hien Model Regression! F1 moi ({f1:.4f}) < F1 cu ({prev_f1:.4f}). "
+                      "Tu dong huy trien khai de hoan tra (rollback) ve phien ban truoc an toan hon."
+                  )
+              print("PASSED: F1 moi >= F1 cu. Du dieu kien release model moi!")
+          else:
+              print("Bonus 4 - Khong phat hien phien ban cu de so sanh (hoac lan dau deploy).")
           PYEOF
 
 
